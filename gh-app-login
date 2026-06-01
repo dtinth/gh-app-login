@@ -1,0 +1,130 @@
+#!/usr/bin/env -S deno run --allow-read --allow-net --allow-run --allow-env
+
+/**
+ * gh-app-login — gh CLI extension
+ *
+ * Authenticates the gh CLI as a GitHub App installation.
+ *
+ * Usage:
+ *   gh app-login [--app-id <id>] [--private-key <path.pem>] [--installation <id>]
+ *
+ * Env vars (overridden by flags):
+ *   GITHUB_APP_ID
+ *   GITHUB_APP_PRIVATE_KEY_PATH
+ *   GITHUB_APP_INSTALLATION_ID
+ */
+
+import { parseArgs } from "jsr:@std/cli/parse-args";
+import { App } from "npm:@octokit/app@16";
+import { createPrivateKey } from "node:crypto";
+
+// --- Args ---
+
+const args = parseArgs(Deno.args, {
+  string: ["app-id", "private-key", "installation"],
+  alias: { a: "app-id", k: "private-key", i: "installation" },
+});
+
+const appId = args["app-id"] ?? Deno.env.get("GITHUB_APP_ID");
+const privateKeyPath = args["private-key"] ?? Deno.env.get("GITHUB_APP_PRIVATE_KEY_PATH");
+const installationFlag = args["installation"] ?? Deno.env.get("GITHUB_APP_INSTALLATION_ID");
+
+if (!appId || !privateKeyPath) {
+  console.error(
+    [
+      "Usage: gh app-login [--app-id <id>] [--private-key <path.pem>] [--installation <id>]",
+      "",
+      "Env vars (overridden by flags):",
+      "  GITHUB_APP_ID",
+      "  GITHUB_APP_PRIVATE_KEY_PATH",
+      "  GITHUB_APP_INSTALLATION_ID   (only required when app has multiple installations)",
+    ].join("\n")
+  );
+  Deno.exit(1);
+}
+
+// --- Load & normalize private key (PKCS#1 → PKCS#8 if needed) ---
+
+const pem = await Deno.readTextFile(privateKeyPath);
+
+function normalizePrivateKey(pem: string): string {
+  if (pem.includes("BEGIN PRIVATE KEY")) return pem; // already PKCS#8
+  if (pem.includes("BEGIN RSA PRIVATE KEY")) {
+    return createPrivateKey(pem).export({ type: "pkcs8", format: "pem" }) as string;
+  }
+  throw new Error("Unrecognized PEM format — expected PKCS#8 or PKCS#1 (RSA) private key.");
+}
+
+const privateKey = normalizePrivateKey(pem);
+
+// --- Set up Octokit App ---
+
+const app = new App({ appId, privateKey });
+
+// --- Resolve installation ---
+
+type Installation = { id: number; account: { login: string; type: string } | null };
+
+console.error("Fetching installations...");
+const installations: Installation[] = [];
+for await (const { installation } of app.eachInstallation.iterator()) {
+  installations.push(installation as Installation);
+}
+
+if (installations.length === 0) {
+  console.error("Error: No installations found for this GitHub App.");
+  Deno.exit(1);
+}
+
+let installationId: number;
+
+if (installations.length === 1) {
+  installationId = installations[0].id;
+  const acct = installations[0].account;
+  const label = acct ? `${acct.type}/${acct.login}` : String(installationId);
+  console.error(`Using installation on ${label} (id: ${installationId})`);
+} else {
+  if (!installationFlag) {
+    console.error("Multiple installations found. Specify one with --installation <id>:\n");
+    for (const inst of installations) {
+      const acct = inst.account;
+      const label = acct ? `${acct.type}/${acct.login}` : "(unknown)";
+      console.error(`  ${inst.id}  ${label}`);
+    }
+    Deno.exit(1);
+  }
+  installationId = Number(installationFlag);
+  const found = installations.find((i) => i.id === installationId);
+  if (!found) {
+    console.error(`Error: Installation ${installationId} not found.`);
+    Deno.exit(1);
+  }
+}
+
+// --- Mint installation token ---
+
+console.error("Minting installation token...");
+const { data } = await app.octokit.request(
+  "POST /app/installations/{installation_id}/access_tokens",
+  { installation_id: installationId }
+);
+
+console.error(`Token expires at: ${data.expires_at}`);
+
+// --- gh auth login --with-token ---
+
+console.error("Running gh auth login...");
+const proc = new Deno.Command("gh", {
+  args: ["auth", "login", "--with-token"],
+  stdin: "piped",
+  stdout: "inherit",
+  stderr: "inherit",
+});
+
+const child = proc.spawn();
+const writer = child.stdin.getWriter();
+await writer.write(new TextEncoder().encode(data.token));
+await writer.close();
+
+const { code } = await child.output();
+Deno.exit(code);
